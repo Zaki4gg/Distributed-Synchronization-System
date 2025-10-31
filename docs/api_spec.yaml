@@ -1,0 +1,21 @@
+openapi: 3.0.3
+info:
+  title: Distributed Sync System API
+  version: 0.1.0
+paths:
+  /lock/acquire:
+    post:
+      summary: Acquire a lock
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                resource: { type: string }
+                mode: { type: string, enum: [shared, exclusive] }
+                client_id: { type: string }
+                timeout_ms: { type: integer }
+      responses:
+        '200': { description: accepted }
