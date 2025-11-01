@@ -1,51 +1,104 @@
-import asyncio, json, time, random, httpx, click
+# benchmarks/load_test_scenarios.py
+# Locust multi-host: Queue + Cache + Lock dalam satu dashboard
+# Jalankan UI:
+#   $env:QUEUE_HOST="http://localhost:8182"
+#   $env:CACHE_HOST="http://localhost:8280"
+#   $env:LOCK_HOST="http://localhost:8081"  # arahkan ke leader
+#   $env:QUEUE_WEIGHT="3"; $env:CACHE_WEIGHT="2"; $env:LOCK_WEIGHT="1"
+#   locust -f benchmarks\load_test_scenarios.py
+#
+# Headless contoh:
+#   locust -f benchmarks\load_test_scenarios.py --headless -u 120 -r 30 -t 2m --csv bench_all
+#
+# Filter di UI pakai tag: queue / cache / lock
 
-async def discover_leader(nodes: list[str]) -> str:
-    for _ in range(10):
-        for n in nodes:
-            try:
-                async with httpx.AsyncClient() as c:
-                    r = await c.get(f"{n}/raft/leader", timeout=1.0)
-                    if r.status_code == 200:
-                        j = r.json()
-                        if j.get("role") == "leader":
-                            return n
-            except Exception:
-                pass
-        await asyncio.sleep(0.2)
-    return nodes[0]
+import os, random
+from locust import HttpUser, task, between, tag
 
-async def spam_locks(leader: str, duration: int, rate: int):
-    st = time.time(); sent = 0; ok = 0; err = 0
-    async with httpx.AsyncClient() as c:
-        while time.time() - st < duration:
-            t0 = time.time()
-            # send `rate` reqs per second
-            for _ in range(rate):
-                res = random.randint(1, 100)
-                try:
-                    r = await c.post(f"{leader}/lock/acquire", json={
-                        "resource": f"res-{res}",
-                        "mode": "shared" if res % 2 else "exclusive",
-                        "client_id": f"cli-{random.randint(1,50)}",
-                        "timeout_ms": 100
-                    }, timeout=1.0)
-                    ok += 1 if r.status_code < 400 else 0
-                except Exception:
-                    err += 1
-                sent += 1
-            await asyncio.sleep(max(0, 1 - (time.time()-t0)))
-    return {"sent": sent, "ok": ok, "err": err}
+# --- Konfigurasi umum (ENV override bila perlu) ---
+QUEUE_TOPIC     = os.getenv("QUEUE_TOPIC", "bench_alpha")
+QUEUE_KEY       = os.getenv("QUEUE_KEY", "user_bench")
+QUEUE_VIS_TTL   = int(os.getenv("QUEUE_VIS_TTL_MS", "3000"))
 
-@click.command()
-@click.option("--nodes", type=str, required=True, help="Comma separated lock node URLs")
-@click.option("--duration", type=int, default=10)
-@click.option("--rate", type=int, default=100)
-async def main(nodes, duration, rate):
-    ns = nodes.split(",")
-    leader = await discover_leader(ns)
-    res = await spam_locks(leader, duration, rate)
-    print(json.dumps(res))
+QUEUE_HOST      = os.getenv("QUEUE_HOST", "http://localhost:8182")
+CACHE_HOST      = os.getenv("CACHE_HOST", "http://localhost:8280")
+LOCK_HOST       = os.getenv("LOCK_HOST",  "http://localhost:8081")  # leader
 
-if __name__ == "__main__":
-    asyncio.run(main())
+QUEUE_WEIGHT    = int(os.getenv("QUEUE_WEIGHT", "3"))
+CACHE_WEIGHT    = int(os.getenv("CACHE_WEIGHT", "2"))
+LOCK_WEIGHT     = int(os.getenv("LOCK_WEIGHT",  "1"))
+
+CACHE_PCT_GET   = int(os.getenv("LOCUST_CACHE_GET",  "80"))
+CACHE_MAX_KEYS  = int(os.getenv("LOCUST_CACHE_KEYS", "5000"))
+LOCK_RES_COUNT  = int(os.getenv("LOCUST_LOCK_RES",   "12"))
+
+# --- Queue: publish + consume+ack (ack via ack_owner) ---
+class QueueUser(HttpUser):
+    host = QUEUE_HOST
+    weight = max(0, QUEUE_WEIGHT)
+    wait_time = between(0.01, 0.05)
+
+    @tag("queue")
+    @task(3)
+    def publish(self):
+        self.client.post(
+            "/queue/publish",
+            params={"topic": QUEUE_TOPIC, "key": QUEUE_KEY},
+            json={"i": random.randint(1, 1_000_000)},
+            name="queue:publish"
+        )
+
+    @tag("queue")
+    @task(1)
+    def consume_and_ack(self):
+        r = self.client.post(
+            "/queue/consume",
+            params={"topic": QUEUE_TOPIC, "key": QUEUE_KEY, "visibility_ttl": QUEUE_VIS_TTL, "max": 10},
+            name="queue:consume"
+        )
+        if r.status_code != 200:
+            return
+        items = r.json() or []
+        for it in items:
+            self.client.post(
+                "/queue/ack_owner",
+                params={"topic": QUEUE_TOPIC, "owner": it.get("owner"), "msg_id": it.get("msg_id")},
+                name="queue:ack_owner"
+            )
+
+# --- Cache: campur GET/PUT sederhana ---
+class CacheUser(HttpUser):
+    host = CACHE_HOST
+    weight = max(0, CACHE_WEIGHT)
+    wait_time = between(0.01, 0.05)
+    pct_get = CACHE_PCT_GET
+    max_keys = CACHE_MAX_KEYS
+
+    @tag("cache")
+    @task
+    def work(self):
+        k = f"k{random.randint(1, self.max_keys)}"
+        if random.randint(1, 100) <= self.pct_get:
+            self.client.get("/cache/get", params={"key": k}, name="cache:get")
+        else:
+            self.client.post("/cache/put", json={"key": k, "value": random.randint(1, 1_000_000)}, name="cache:put")
+
+# --- Lock: exclusive acquire + release ke leader ---
+class LockUser(HttpUser):
+    host = LOCK_HOST
+    weight = max(0, LOCK_WEIGHT)
+    wait_time = between(0.01, 0.03)
+    resources = [f"res_{i}" for i in range(LOCK_RES_COUNT)]
+
+    @tag("lock")
+    @task
+    def exclusive_lock_cycle(self):
+        res = random.choice(self.resources)
+        r = self.client.post(
+            "/lock/acquire",
+            json={"resource": res, "mode": "exclusive", "client_id": "locust", "timeout_ms": 2000},
+            name="lock:acquire_exclusive"
+        )
+        if r.status_code == 200 and (r.json() or {}).get("granted"):
+            tok = r.json().get("token")
+            self.client.post("/lock/release", json={"resource": res, "token": tok}, name="lock:release")

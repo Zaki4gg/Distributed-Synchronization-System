@@ -1,21 +1,425 @@
 openapi: 3.0.3
 info:
-  title: Distributed Sync System API
-  version: 0.1.0
+  title: Distributed Synchronization System API
+  version: "1.0.0"
+  description: |
+    API untuk tiga komponen: Distributed Lock Manager (Raft), Distributed Queue (consistent hashing + at-least-once),
+    dan Distributed Cache (MESI + invalidation + TTL + LRU). Semua endpoint memakai HTTP+JSON.
+servers:
+  - url: http://localhost:{port}
+    variables:
+      port:
+        default: "8081"
+        description: Port default contoh (gantikan sesuai layanan).
+tags:
+  - name: raft
+    description: Endpoint status konsensus (Lock Manager)
+  - name: lock
+    description: Distributed lock (shared/exclusive) di atas Raft
+  - name: queue
+    description: Distributed queue dengan consistent hashing & at-least-once
+  - name: cache
+    description: Distributed cache coherence (MESI) + TTL + LRU
+  - name: meta
+    description: Health & readiness
+
 paths:
+  /raft/leader:
+    get:
+      tags: [raft]
+      summary: Lihat peran node di cluster Raft
+      responses:
+        "200":
+          description: Peran node saat ini
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RaftRole'
+
   /lock/acquire:
     post:
-      summary: Acquire a lock
+      tags: [lock]
+      summary: Acquire lock (shared/exclusive)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LockAcquireRequest' }
+      responses:
+        "200":
+          description: Hasil acquire
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LockAcquireResponse' }
+
+  /lock/release:
+    post:
+      tags: [lock]
+      summary: Release lock dengan token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LockReleaseRequest' }
+      responses:
+        "200":
+          description: Hasil release
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LockReleaseResponse' }
+
+  /lock/state:
+    get:
+      tags: [lock]
+      summary: Lihat state resource tertentu atau seluruhnya
+      parameters:
+        - in: query
+          name: resource
+          schema: { type: string }
+          description: Jika diisi, hanya kembalikan state untuk resource ini.
+      responses:
+        "200":
+          description: Peta state lock
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LockStateMap'
+
+  /queue/publish:
+    post:
+      tags: [queue]
+      summary: Publish pesan ke topic (opsional key untuk consistent hashing)
+      parameters:
+        - in: query
+          name: topic
+          required: true
+          schema: { type: string }
+        - in: query
+          name: key
+          schema: { type: string }
+          description: |
+            Jika diisi, menentukan shard/owner berdasarkan consistent hashing.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                resource: { type: string }
-                mode: { type: string, enum: [shared, exclusive] }
-                client_id: { type: string }
-                timeout_ms: { type: integer }
+              $ref: '#/components/schemas/ArbitraryJson'
       responses:
-        '200': { description: accepted }
+        "200":
+          description: Pesan diterima
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  msg_id: { type: string }
+                  owners:
+                    type: array
+                    items: { type: string }
+                    description: Daftar owner untuk (topic,key) bila key disediakan.
+                required: [msg_id]
+
+  /queue/consume:
+    post:
+      tags: [queue]
+      summary: Ambil batch pesan (at-least-once via visibility TTL)
+      parameters:
+        - in: query
+          name: topic
+          required: true
+          schema: { type: string }
+        - in: query
+          name: key
+          schema: { type: string }
+          description: Untuk memaksa shard yang sama (jika digunakan).
+        - in: query
+          name: visibility_ttl
+          required: true
+          schema: { type: integer, format: int64, minimum: 1 }
+          description: Waktu (ms) pesan "in-flight" sebelum bisa dikirim ulang bila tidak di-ACK.
+        - in: query
+          name: max
+          schema: { type: integer, minimum: 1, default: 10 }
+      responses:
+        "200":
+          description: Daftar pesan
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/QueueItem'
+
+  /queue/ack:
+    post:
+      tags: [queue]
+      summary: ACK pesan oleh owner langsung (idempotent)
+      parameters:
+        - in: query
+          name: topic
+          required: true
+          schema: { type: string }
+        - in: query
+          name: msg_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Hasil ACK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AckResponse' }
+
+  /queue/ack_owner:
+    post:
+      tags: [queue]
+      summary: ACK pesan via proxy ke owner tertentu (idempotent)
+      parameters:
+        - in: query
+          name: topic
+          required: true
+          schema: { type: string }
+        - in: query
+          name: owner
+          required: true
+          schema: { type: string }
+          description: URL owner (contoh "http://queue3:8182"). URL-encode jika client tidak meng-encode otomatis.
+        - in: query
+          name: msg_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Hasil ACK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AckResponse' }
+
+  /queue/owners:
+    get:
+      tags: [queue]
+      summary: Lihat daftar owners untuk (topic,key)
+      parameters:
+        - in: query
+          name: topic
+          required: true
+          schema: { type: string }
+        - in: query
+          name: key
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Owners dan identitas node saat ini
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  owners:
+                    type: array
+                    items: { type: string }
+                  self: { type: string }
+                required: [owners, self]
+
+  /readyz:
+    get:
+      tags: [meta]
+      summary: Kesiapan layanan
+      responses:
+        "200":
+          description: Kesiapan OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: boolean }
+                  status: { type: string }
+
+  /cache/put:
+    post:
+      tags: [cache]
+      summary: Simpan/overwrite nilai pada key (opsional TTL)
+      parameters:
+        - in: query
+          name: ttl_ms
+          schema: { type: integer, format: int64, minimum: 1 }
+          description: Masa hidup entry (ms). Jika kosong, non-expiring.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CachePutRequest' }
+      responses:
+        "200":
+          description: Hasil penyimpanan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { stored: { type: boolean } }
+                required: [stored]
+
+  /cache/get:
+    get:
+      tags: [cache]
+      summary: Ambil nilai key (coherence-aware)
+      parameters:
+        - in: query
+          name: key
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Hasil pembacaan
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CacheGetResponse' }
+
+  /cache/state:
+    get:
+      tags: [cache]
+      summary: Lihat state MESI untuk key di node saat ini
+      parameters:
+        - in: query
+          name: key
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: State MESI
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CacheStateResponse' }
+
+  /cache/metrics:
+    get:
+      tags: [cache]
+      summary: Metrics cache (hits/misses/puts/evictions/invalidation)
+      responses:
+        "200":
+          description: Metrics per-node
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CacheMetrics' }
+
+components:
+  schemas:
+    RaftRole:
+      type: object
+      properties:
+        role: { type: string, enum: [leader, follower, candidate] }
+        leader:
+          type: string
+          nullable: true
+          description: Nama leader bila node ini follower/candidate.
+      required: [role]
+    LockAcquireRequest:
+      type: object
+      properties:
+        resource: { type: string }
+        mode: { type: string, enum: [shared, exclusive] }
+        client_id: { type: string }
+        timeout_ms: { type: integer, minimum: 1 }
+      required: [resource, mode, client_id, timeout_ms]
+    LockAcquireResponse:
+      type: object
+      properties:
+        granted: { type: boolean }
+        token: { type: string }
+        mode: { type: string }
+        resource: { type: string }
+      required: [granted, resource]
+    LockReleaseRequest:
+      type: object
+      properties:
+        resource: { type: string }
+        token: { type: string }
+      required: [resource, token]
+    LockReleaseResponse:
+      type: object
+      properties:
+        released: { type: boolean }
+        resource: { type: string }
+      required: [released, resource]
+    Holder:
+      type: object
+      properties:
+        client: { type: string }
+        token: { type: string }
+    Waiter:
+      type: object
+      properties:
+        client: { type: string }
+        mode: { type: string, enum: [shared, exclusive] }
+    LockState:
+      type: object
+      properties:
+        mode: { type: string, enum: [shared, exclusive] }
+        holders:
+          type: array
+          items: { $ref: '#/components/schemas/Holder' }
+        queue:
+          type: array
+          items: { $ref: '#/components/schemas/Waiter' }
+    LockStateMap:
+      type: object
+      additionalProperties:
+        $ref: '#/components/schemas/LockState'
+      description: Peta {resource -> state}. Jika query ?resource, map hanya mengandung satu key.
+
+    ArbitraryJson:
+      type: object
+      additionalProperties: true
+
+    QueueItem:
+      type: object
+      properties:
+        msg_id: { type: string }
+        payload: { $ref: '#/components/schemas/ArbitraryJson' }
+        owner:
+          type: string
+          description: Owner queue yang menyimpan pesan.
+      required: [msg_id, payload]
+    AckResponse:
+      type: object
+      properties:
+        acked: { type: boolean }
+        reason: { type: string }
+      required: [acked]
+
+    CachePutRequest:
+      type: object
+      properties:
+        key: { type: string }
+        value: { nullable: true }
+      required: [key]
+    CacheGetResponse:
+      type: object
+      properties:
+        hit: { type: boolean }
+        value: { nullable: true }
+      required: [hit]
+    CacheStateResponse:
+      type: object
+      properties:
+        key: { type: string }
+        state: { type: string, enum: [M, E, S, I] }
+      required: [key, state]
+    CacheMetrics:
+      type: object
+      properties:
+        node: { type: string }
+        metrics:
+          type: object
+          properties:
+            hits: { type: integer }
+            misses: { type: integer }
+            puts: { type: integer }
+            evictions: { type: integer }
+            inv_sent: { type: integer, description: Invalidation dikirim }
+            inv_recv: { type: integer, description: Invalidation diterima }
+        capacity: { type: integer }
+        evictions: { type: integer }
